@@ -10,8 +10,14 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
+
+enum class ConnectionState{
+    Connected,
+    Connecting,
+    Disconnected
+}
 
 class BluetoothManager(
     private val context: Context,
@@ -19,15 +25,25 @@ class BluetoothManager(
 ) {
     private var bluetoothGatt: BluetoothGatt? = null
 
-    // Initially null — you’ll set them once you identify the correct ones
-    private var serviceUuid: String? = null
-    private var characteristicUuid: String? = null
-
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
 
     private val _sensorData = MutableStateFlow<SensorData?>(null)
     val sensorData: StateFlow<SensorData?> = _sensorData
+
+    private val _connectionState = MutableStateFlow(ConnectionState.Disconnected)
+    val connectionState: StateFlow<ConnectionState> = _connectionState
+
+    private val _ackMessage = MutableStateFlow<String?>(null)
+    val ackMessage: StateFlow<String?> = _ackMessage.asStateFlow()
+
+    // ✅ Holds last single value
+    private val _data = MutableStateFlow("")
+    val data: StateFlow<String> = _data.asStateFlow()
+
+    // Rolling buffer of max 10 received values
+    private val _dataList = MutableStateFlow<List<String>>(emptyList())
+    val dataList: StateFlow<List<String>> = _dataList.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -52,12 +68,30 @@ class BluetoothManager(
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     Log.d("BLEManager", "✅ Connected to GATT server")
+                    _connectionState.value=ConnectionState.Connected
                     gatt.discoverServices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
+                    _connectionState.value=ConnectionState.Disconnected
                     Log.d("BLEManager", "❌ Disconnected from GATT server")
                     disconnect()
                 }
+                BluetoothProfile.STATE_CONNECTING -> {
+                    _connectionState.value=ConnectionState.Connecting
+                    Log.d("BLEManager","Connecting")
+                }
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d("BLEManager", "✅ Write confirmed by device: ${String(characteristic.value)}")
+            } else {
+                Log.e("BLEManager", "❌ Write failed, status=$status")
             }
         }
 
@@ -69,15 +103,18 @@ class BluetoothManager(
                     for (characteristic in service.characteristics) {
                         val props = characteristic.properties
 
+                        Log.d("Properties",props.toString())
+
                         if (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 && notifyCharacteristic == null) {
                             notifyCharacteristic = characteristic
                             enableNotifications(gatt, characteristic)
+                            writeCharacteristic = characteristic
                             Log.d("BLEManager", "📡 Subscribed to NOTIFY characteristic: ${characteristic.uuid}")
                         }
 
                         if (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 && writeCharacteristic == null) {
-                            writeCharacteristic = characteristic
-                            Log.d("BLEManager", "✍️ Found WRITE characteristic: ${characteristic.uuid}")
+//                            writeCharacteristic = characteristic
+//                            Log.d("BLEManager", "✍️ Found WRITE characteristic: ${characteristic.uuid}")
                         }
                     }
                 }
@@ -102,22 +139,33 @@ class BluetoothManager(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            val data = characteristic.value?.decodeToString() ?: return
-            Log.d("BLEManager", "📥 Received: $data")
+            val dataBytes = characteristic.value ?: return
+            // Convert the byte array to a String using a specific charset (usually UTF-8)
+            val receivedString = String(dataBytes, Charsets.UTF_8)
 
-            if (data.startsWith("R:")) {
-                val parts = data.removePrefix("R:").split(",")
-                if (parts.size == 4) {
-                    val acc = parts[0].toFloatOrNull() ?: return
-                    val la = parts[1].toFloatOrNull() ?: return
-                    val gy = parts[2].toFloatOrNull() ?: return
-                    val roll = parts[3].toFloatOrNull() ?: return
+            Log.d("BLEManager", "📥 Received: $receivedString")
 
-                    scope.launch {
-                        _sensorData.value = SensorData(acc, la, gy, roll)
-                    }
+            _data.value = receivedString
+
+            if (receivedString.startsWith("cal")||
+                receivedString.startsWith("vibtime")||
+                receivedString.startsWith("vibtimegap")||
+                receivedString.startsWith("vibcount")||
+                receivedString.startsWith("maxdelay"))
+            {
+                if(receivedString == "cal,1"){
+
                 }
+                _ackMessage.value=receivedString
             }
+
+            // Append to rolling buffer of 10
+            val currentList = _dataList.value.toMutableList()
+            if (currentList.size >= 10) {
+                currentList.removeAt(0) // remove oldest
+            }
+            currentList.add(receivedString)
+            _dataList.value = currentList
         }
     }
 
@@ -134,13 +182,17 @@ class BluetoothManager(
     /** Example of sending commands (start/stop) */
     fun writeCommand(command: String) {
         val characteristic = writeCharacteristic
-        if (characteristic != null) {
-            characteristic.value = command.toByteArray(Charsets.UTF_8)
-            bluetoothGatt?.writeCharacteristic(characteristic)
-            Log.d("BLEManager", "✍️ Command sent: $command")
-        } else {
-            Log.e("BLEManager", "⚠️ No writable characteristic available!")
-        }
+        characteristic?.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        val commandBytes = (command + "\n").toByteArray(Charsets.UTF_8)
+
+        characteristic?.value = commandBytes
+
+        val success = bluetoothGatt?.writeCharacteristic(characteristic) ?: false
+        Log.d("BLEManager", "➡️ Sending: '$command' (success queued = $success)")
+    }
+
+    fun clearDataList() {
+        _dataList.value = emptyList()
     }
 
     fun startReading() {
@@ -150,4 +202,5 @@ class BluetoothManager(
     fun stopReading() {
         writeCommand("stop\n")
     }
+
 }

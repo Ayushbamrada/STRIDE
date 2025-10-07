@@ -1,13 +1,16 @@
 package com.example.stride.ui.viewmodel
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
-import com.example.stride.bluetooth.BluetoothManager
 
-class SensorViewModelFactory(
-    private val bluetoothManager: BluetoothManager
-) : ViewModelProvider.Factory {
+class SensorViewModelFactory(private val context: Context) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
-        return SensorViewModel(bluetoothManager) as T
+        if (modelClass.isAssignableFrom(SensorViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            // Add the "as T" cast here
+            return SensorViewModel(context) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
     }
 }
