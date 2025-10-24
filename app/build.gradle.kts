@@ -57,6 +57,8 @@ dependencies {
 
     // ADD THESE THREE LINES FOR HILT
     implementation("com.google.dagger:hilt-android:2.51")
+    implementation(libs.play.services.places)
+    implementation(libs.mediation.test.suite)
     kapt("com.google.dagger:hilt-compiler:2.51")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
